@@ -26,7 +26,10 @@ print_hex_long_is_alpha:
     jmp print_hex_long_loop        
 print_hex_long_end:	
     mov rbx, HEX_OUT_LONG
+    push rdi
+    mov rdi, 0xb8000
     call print_string_long
+    pop rdi
 
     pop rcx
     pop rbx
