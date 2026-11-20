@@ -1,125 +1,107 @@
+; 32비트 보호 모드 -> 64비트 롱 모드 전환
+; (OSDev의 "real mode에서 바로 long mode" 예제를 보호 모드에서 쓰도록 32비트로 고침)
+[bits 32]
+
 %define PAGE_PRESENT    (1 << 0)
 %define PAGE_WRITE      (1 << 1)
 
 %define CODE_SEG_LONG     0x0008
 %define DATA_SEG_LONG     0x0010
 
+PAGING_BASE equ 0x9000          ; PML4/PDPT/PD/PT 4개 = 16KiB (0x9000 ~ 0xCFFF)
+
 ALIGN 4
 IDT:
     .Length       dw 0
     .Base         dd 0
 
-; Function to switch directly to long mode from real mode.
-; Identity maps the first 2MiB.
-; Uses Intel syntax.
-
-; es:edi    Should point to a valid page-aligned 16KiB buffer, for the PML4, PDPT, PD and a PT.
-; ss:esp    Should point to memory that can be used as a small (1 uint32_t) stack
-
+; 첫 2MiB를 identity map 한 뒤 롱 모드로 들어간다. 돌아오지 않음.
 switch_to_lm:
-	mov edi, 0x9000
-    ; Zero out the 16KiB buffer.
-    ; Since we are doing a rep stosd, count should be bytes/4.   
-    push di                           ; REP STOSD alters DI.
-    mov ecx, 0x1000
+    ; 16KiB 버퍼를 0으로 채움 (ES = 평면 데이터 세그먼트)
+    mov edi, PAGING_BASE
+    mov ecx, 0x1000                   ; 16KiB / 4
     xor eax, eax
     cld
     rep stosd
-    pop di                            ; Get DI back.
-	
-    ; Build the Page Map Level 4.
-    ; es:di points to the Page Map Level 4 table.
-    lea eax, [es:di + 0x1000]         ; Put the address of the Page Directory Pointer Table in to EAX.
-    or eax, PAGE_PRESENT | PAGE_WRITE ; Or EAX with the flags - present flag, writable flag.
-    mov [es:di], eax                  ; Store the value of EAX as the first PML4E.
-	
+    mov edi, PAGING_BASE
 
-    ; Build the Page Directory Pointer Table.
-    lea eax, [es:di + 0x2000]         ; Put the address of the Page Directory in to EAX.
-    or eax, PAGE_PRESENT | PAGE_WRITE ; Or EAX with the flags - present flag, writable flag.
-    mov [es:di + 0x1000], eax         ; Store the value of EAX as the first PDPTE.
+    ; PML4[0] -> PDPT
+    lea eax, [edi + 0x1000]
+    or eax, PAGE_PRESENT | PAGE_WRITE
+    mov [edi], eax
 
-    
-    ; Build the Page Directory.
-    lea eax, [es:di + 0x3000]         ; Put the address of the Page Table in to EAX.
-    or eax, PAGE_PRESENT | PAGE_WRITE ; Or EAX with the flags - present flag, writeable flag.
-    mov [es:di + 0x2000], eax         ; Store to value of EAX as the first PDE.
-    
-    
-    push di                           ; Save DI for the time being.
-    lea di, [di + 0x3000]             ; Point DI to the page table.
-    mov eax, PAGE_PRESENT | PAGE_WRITE    ; Move the flags into EAX - and point it to 0x0000.
+    ; PDPT[0] -> PD
+    lea eax, [edi + 0x2000]
+    or eax, PAGE_PRESENT | PAGE_WRITE
+    mov [edi + 0x1000], eax
 
-    ; Build the Page Table.
+    ; PD[0] -> PT
+    lea eax, [edi + 0x3000]
+    or eax, PAGE_PRESENT | PAGE_WRITE
+    mov [edi + 0x2000], eax
+
+    ; PT: 512개 엔트리로 0 ~ 2MiB identity map
+    lea ebx, [edi + 0x3000]
+    mov eax, PAGE_PRESENT | PAGE_WRITE
 .LoopPageTable:
-    mov [es:di], eax
+    mov [ebx], eax
     add eax, 0x1000
-    add di, 8
-    cmp eax, 0x200000                 ; If we did all 2MiB, end.
+    add ebx, 8
+    cmp eax, 0x200000
     jb .LoopPageTable
 
-    pop di                            ; Restore DI.
-
-	
-    ; Disable IRQs
-    mov al, 0xFF                      ; Out 0xFF to 0xA1 and 0x21 to disable all IRQs.
+    ; PIC의 모든 IRQ 마스크
+    mov al, 0xFF
     out 0xA1, al
     out 0x21, al
-    
-    nop
-    nop
 
-    lidt [IDT]                        ; Load a zero length IDT so that any NMI causes a triple fault.
-	
-    ; Enter long mode.
-    mov eax, 10100000b                ; Set the PAE and PGE bit.
+    lidt [IDT]                        ; 길이 0인 IDT: 예외가 나면 triple fault
+
+    ; CR4.PAE(bit5) | CR4.PGE(bit7)
+    mov eax, cr4
+    or eax, (1 << 5) | (1 << 7)
     mov cr4, eax
 
-    mov edx, edi                      ; Point CR3 at the PML4.
-    mov cr3, edx
-	
-    mov ecx, 0xC0000080               ; Read from the EFER MSR. 
-    rdmsr    
-	
-    or eax, 0x00000100                ; Set the LME bit.
-    wrmsr
-	
-    mov ebx, cr0                      ; Activate long mode -
-    or ebx,0x80000001                 ; - by enabling paging and protection simultaneously.
-    mov cr0, ebx                    
+    mov cr3, edi                      ; CR3 = PML4
 
-    lgdt [GDT.Pointer]                ; Load GDT.Pointer defined below.
-    
-    jmp CODE_SEG_LONG:LongMode             ; Load CS with 64 bit segment and flush the instruction cache
-      
-      
-    ; Global Descriptor Table
+    ; EFER.LME 설정
+    mov ecx, 0xC0000080
+    rdmsr
+    or eax, (1 << 8)
+    wrmsr
+
+    ; 페이징 활성화 (PE는 이미 켜져 있음) -> 호환 모드
+    mov eax, cr0
+    or eax, (1 << 31)
+    mov cr0, eax
+
+    lgdt [GDT.Pointer]
+    jmp CODE_SEG_LONG:LongMode        ; 64비트 코드 세그먼트로 far jump
+
+; 64비트용 GDT
 GDT:
 .Null:
-    dq 0x0000000000000000             ; Null Descriptor - should be present.
-
+    dq 0x0000000000000000             ; Null Descriptor
 .Code:
-    dq 0x00209A0000000000             ; 64-bit code descriptor (exec/read).
-    dq 0x0000920000000000             ; 64-bit data descriptor (read/write).
-      
+    dq 0x00209A0000000000             ; 64-bit code descriptor (exec/read)
+.Data:
+    dq 0x0000920000000000             ; 64-bit data descriptor (read/write)
+.End:
+
 ALIGN 4
-    dw 0                              ; Padding to make the "address of the GDT" field aligned on a 4-byte boundary
-
+    dw 0                              ; 아래 dd가 4바이트 정렬되도록 패딩
 .Pointer:
-    dw $ - GDT - 1                    ; 16-bit Size (Limit) of GDT.
-    dd GDT                            ; 32-bit Base Address of GDT. (CPU will zero extend to 64-bit)
+    dw .End - GDT - 1                 ; GDT 크기 - 1
+    dd GDT
 
-
-[BITS 64]      
+[bits 64]
 LongMode:
-
     mov ax, DATA_SEG_LONG
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
     mov ss, ax
-	
-	
-    jmp BEGIN_LM                     ; You should replace this jump to wherever you want to jump to.
-	
+    mov rsp, 0x90000
+
+    jmp BEGIN_LM
